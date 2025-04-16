@@ -4,61 +4,112 @@ admin.initializeApp();
 
 const db = admin.firestore();
 
-exports.dialogflowFirebaseFulfillment = functions.https.onRequest(async (request, response) => {
-  const intent = request.body.queryResult?.intent?.displayName;
-  const parameters = request.body.queryResult?.parameters;
+exports.dialogflowFirebaseFulfillment = functions.https.onRequest(async (req, res) => {
+  const intent = req.body.queryResult?.intent?.displayName;
+  const params = req.body.queryResult?.parameters || {};
+  const session = req.body.session;
 
   try {
-    switch (intent) {
-      case "hacer pedido":
-        const producto = parameters?.producto;
-        const cantidad = parameters?.cantidad;
+    if (intent === "hacer pedido") {
+      const pedidoInput = params["pedido"];
+      const cantidad = params["cantidad"];
+      
+      if (!pedidoInput || !cantidad) {
+        return res.json({
+          fulfillmentText: "Por favor indica el producto y la cantidad.",
+        });
+      }
 
-        if (!producto || !cantidad) {
-          return response.json({
-            fulfillmentText: "Por favor, proporciona el nombre del producto y la cantidad.",
-          });
+      // Buscar producto en catálogo de forma flexible
+      const catalogoSnap = await db.collection("catalogo").get();
+      let productoEncontrado = null;
+
+      catalogoSnap.forEach(doc => {
+        const producto = doc.data();
+        if (pedidoInput.toLowerCase().includes(producto.nombre.toLowerCase())) {
+          productoEncontrado = producto;
         }
+      });
 
-        // Guardar el pedido en Firestore
-        await db.collection("pedidos").add({
-          producto: producto,
-          cantidad: cantidad,
-          fecha: admin.firestore.FieldValue.serverTimestamp(),
+      if (!productoEncontrado) {
+        return res.json({
+          fulfillmentText: `❌ El producto "${pedidoInput}" no está disponible en el catálogo.`,
         });
+      }
 
-        return response.json({
-          fulfillmentText: `🛍️ Tu pedido de ${cantidad} ${producto}(s) ha sido procesado con éxito.`,
-        });
-
-      case "mostrar catalogo":
-        const snapshot = await db.collection("catalogo").get();
-
-        if (snapshot.empty) {
-          return response.json({
-            fulfillmentText: "No hay productos disponibles en el catálogo en este momento.",
-          });
-        }
-
-        const productos = [];
-        snapshot.forEach(doc => {
-          const data = doc.data();
-          productos.push(`${data.nombre} - $${data.precio}`);
-        });
-
-        return response.json({
-          fulfillmentText: `🛒 Aquí tienes el catálogo:\n\n${productos.join('\n')}`,
-        });
-
-      default:
-        return response.json({
-          fulfillmentText: "No se reconoció la intención.",
-        });
+      return res.json({
+        fulfillmentText: `¿Confirmas tu pedido de ${cantidad} ${productoEncontrado.nombre} por $${productoEncontrado.precio}?`,
+        outputContexts: [
+          {
+            name: `${session}/contexts/pedido-pendiente`,
+            lifespanCount: 5,
+            parameters: {
+              pedido: productoEncontrado.nombre,
+              precio: productoEncontrado.precio,
+              cantidad,
+            },
+          },
+        ],
+      });
     }
+
+    if (intent === "confirmar pedido") {
+      const context = req.body.queryResult.outputContexts.find(ctx =>
+        ctx.name.endsWith("/contexts/pedido-pendiente")
+      );
+      const data = context?.parameters;
+
+      if (!data || !data.pedido || !data.cantidad || !data.precio) {
+        return res.json({
+          fulfillmentText: "No se encontraron datos para confirmar el pedido.",
+        });
+      }
+
+      const pedidosRef = db.collection("pedidos");
+      const snapshot = await pedidosRef.get();
+      const nuevoID = `pedido${snapshot.size + 1}`;
+
+      // Guardar el pedido en Firestore
+      await pedidosRef.doc(nuevoID).set({
+        pedido: data.pedido,
+        precio: data.precio,
+        cantidad: data.cantidad,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return res.json({
+        fulfillmentText: `✅ Tu pedido de ${data.cantidad} ${data.pedido} fue registrado exitosamente como "${nuevoID}".`,
+      });
+    }
+
+    if (intent === "mostrar catalogo") {
+      const catalogoSnap = await db.collection("catalogo").get();
+
+      if (catalogoSnap.empty) {
+        return res.json({
+          fulfillmentText: "📭 El catálogo está vacío actualmente.",
+        });
+      }
+
+      let catalogoTexto = "📦 Aquí tienes el catálogo:\n";
+      catalogoSnap.forEach(doc => {
+        const producto = doc.data();
+        catalogoTexto += `• ${producto.nombre} - $${producto.precio}\n`;
+      });
+
+      return res.json({
+        fulfillmentText: catalogoTexto,
+      });
+    }
+
+    return res.json({
+      fulfillmentText: "No se reconoció la intención.",
+    });
+
   } catch (error) {
-    console.error("❌ Error en el fulfillment:", error);
-    return response.json({
-      fulfillmentText: "Ocurrió un error al procesar tu solicitud.",
+    console.error("Error en fulfillment:", error);
+    return res.json({
+      fulfillmentText: "⚠️ Ocurrió un error procesando tu solicitud.",
     });
   }
 });
